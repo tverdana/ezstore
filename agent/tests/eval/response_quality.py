@@ -1,5 +1,6 @@
 """Local LLM-as-judge for `custom_response_quality` (see eval_config.yaml)."""
 
+import os
 import threading
 
 from google import genai
@@ -51,7 +52,7 @@ def evaluate(instance):
     prompt += f"Full Agent Trace: {instance.get('agent_data', '')}\n"
 
     response = _client().models.generate_content(
-        model="gemini-3.8-flash",
+        model=os.environ.get("AGENT_MODEL", "gemini-3.8-flash"),
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0,  # deterministic grading

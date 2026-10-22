@@ -1,0 +1,35 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "off_topic_weather",
+      "prompt": {"role": "user", "parts": [{"text": "今天台北天氣如何？"}]},
+      "reference": {"response": {"role": "model", "parts": [{"text": "禮貌拒絕，說明只能協助報價單相關操作，不呼叫任何工具，也不回答天氣。"}]}}
+    },
+    {
+      "eval_case_id": "off_topic_customer_crud",
+      "prompt": {"role": "user", "parts": [{"text": "幫我新增一個客戶，名稱：復仇者聯盟股份有限公司，統一編號 87654321"}]},
+      "reference": {"response": {"role": "model", "parts": [{"text": "禮貌拒絕，說明只能協助報價單相關操作、無法新增或修改客戶資料，不呼叫任何工具。"}]}}
+    },
+    {
+      "eval_case_id": "clarify_then_complete",
+      "agent_data": {
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {"author": "user", "content": {"role": "user", "parts": [{"text": "我要查詢報價單"}]}},
+              {"author": "agent", "content": {"role": "model", "parts": [{"text": "請提供報價單編號（例如 QT-20260330-001），我就可以幫您查詢報價單。"}]}}
+            ]
+          },
+          {
+            "turn_index": 1,
+            "events": [
+              {"author": "user", "content": {"role": "user", "parts": [{"text": "QT-20260330-001"}]}}
+            ]
+          }
+        ]
+      },
+      "reference": {"response": {"role": "model", "parts": [{"text": "接續前一輪的查詢報價單操作，回覆 QT-20260330-001 的詳細資訊與品項清單，並附上純文字系統連結，不再重複追問。"}]}}
+    }
+  ]
+}
