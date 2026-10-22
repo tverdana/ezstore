@@ -59,6 +59,24 @@ MISSING_CREDENTIALS_TEXT = (
     "GEMINI_API_KEY，或設定 Vertex AI（GOOGLE_GENAI_USE_VERTEXAI=true、"
     "GOOGLE_CLOUD_PROJECT、GOOGLE_CLOUD_LOCATION）後重新啟動 Agent。"
 )
+QUOTA_EXHAUSTED_TEXT = (
+    "Gemini 模型的請求額度已用完（429 RESOURCE_EXHAUSTED），自動重試後仍然失敗。"
+    "免費方案每分鐘與每日的請求數有限，請稍後再試，或改用其他 API key／Vertex AI。"
+)
+MODEL_UNAVAILABLE_TEXT = (
+    "Gemini 模型服務暫時無法使用（503 UNAVAILABLE），自動重試後仍然失敗，請稍後再試。"
+)
+
+# 模型呼叫的重試：google-genai 內建的指數退避（tenacity wait_exponential_jitter）。
+# 共 4 次（3 次重試），等待約 2、4、8 秒再加 0–1 秒抖動，只針對 429 與 503。
+MODEL_RETRY_OPTIONS = types.HttpRetryOptions(
+    attempts=4,
+    initial_delay=2.0,
+    exp_base=2.0,
+    max_delay=16.0,
+    jitter=1.0,
+    http_status_codes=[429, 503],
+)
 
 
 class Intent(StrEnum):
@@ -215,15 +233,32 @@ def _before_model(
     )
 
 
+def _on_model_error(
+    callback_context: CallbackContext, llm_request: LlmRequest, error: Exception
+) -> LlmResponse | None:
+    """重試用盡後仍是 429／503 時，回報使用者看得懂的錯誤訊息。"""
+    code = getattr(error, "code", None)
+    if code == 429:
+        return LlmResponse(
+            error_code="RESOURCE_EXHAUSTED", error_message=QUOTA_EXHAUSTED_TEXT
+        )
+    if code == 503:
+        return LlmResponse(
+            error_code="UNAVAILABLE", error_message=MODEL_UNAVAILABLE_TEXT
+        )
+    return None
+
+
 classify_intent = LlmAgent(
     name="classify_intent",
     model=Gemini(
         model=MODEL,
-        retry_options=types.HttpRetryOptions(attempts=3),
+        retry_options=MODEL_RETRY_OPTIONS,
     ),
     include_contents="none",
     output_schema=IntentResult,
     before_model_callback=_before_model,
+    on_model_error_callback=_on_model_error,
     generate_content_config=types.GenerateContentConfig(temperature=0),
     instruction="""你是 EZStore 報價單管理助手的意圖分類器。只做分類與擷取參數，不回答問題。
 
@@ -249,8 +284,12 @@ intent 只能是下列其中之一：
 )
 
 
-def route_intent(ctx: Context, node_input: IntentResult) -> Event:
+def route_intent(ctx: Context, node_input: IntentResult | None) -> Event | None:
     """以程式決定下一個節點：操作、追問或拒答。"""
+    if node_input is None:
+        # 模型呼叫失敗（沒有憑證、429、503）：錯誤事件已由 classify_intent 的
+        # callback 送出，這裡結束本輪，不呼叫任何工具
+        return None
     user_text = ctx.state.get("last_user_message", "")
     pending = ctx.state.get(PENDING_KEY) or {}
     intent = node_input.intent
