@@ -27,7 +27,7 @@ EZStore provides four core modules for managing the B2B sales pipeline:
 | Backend | Go 1.25 · Gin · GORM · Swagger (swaggo) · Testify |
 | Frontend | React 19 · TypeScript · Tailwind CSS 4 · Vite 8 · TanStack React Query · React Hook Form · React Router |
 | Database | PostgreSQL 16 |
-| AI Agent | Python 3.12 · Google ADK 2.10+ (graph Workflow API) · google-agents-cli 1.7 · Gemini 3.8 Flash · MCP Python SDK 2.x (Streamable HTTP) · uv |
+| AI Agent | Python 3.12 · Google ADK 2.10+ (graph Workflow API) · google-agents-cli 1.11 · Gemini 3.8 Flash · MCP Python SDK 2.x (Streamable HTTP) · uv |
 | Build & Deploy | Docker · Docker Compose · Bun (frontend) · Nginx (frontend serving & API proxy) |
 
 ### Project Structure
@@ -38,8 +38,11 @@ ezstore/
 ├── scripts/
 │   └── seed-test-data.sql      # Idempotent test dataset (TRUNCATE + INSERT)
 ├── .env.example                # GEMINI_API_KEY and agent settings (copy to .env)
-├── agent/                      # ★ LAB deliverable — not in this branch. Build it from agent-spec-prompt.md
-│                               #   (agents-cli scaffold → ADK 2.x graph Workflow → connect to mcp_server)
+├── agent/                      # ADK 2.x graph Workflow agent, built from agent-spec-prompt.md (see agent/README.md)
+│   ├── Dockerfile
+│   ├── pyproject.toml           # google-adk[mcp,a2a]>=2.10,<3 (+ uv.lock)
+│   ├── quotation_agent/         # agent.py (Workflow), fast_api_app.py (ADK FastAPI + A2A)
+│   └── tests/                   # unit/, integration/, eval/ (datasets + eval_config.yaml)
 ├── mcp_server/
 │   ├── Dockerfile
 │   ├── pyproject.toml           # mcp>=2.2, httpx (+ uv.lock)
@@ -254,29 +257,40 @@ profit_rate  = profit ÷ total_price
 
 ### AI Agent
 
-> **This branch (`workshop-start`) is the lab starting point.** The backend, frontend Chat UI, MCP Server and database are provided; the `agent/` service is what you build by feeding `agent-spec-prompt.md` to your AI coding tool. The description below is the target you are building toward.
+> `agent/` was built on this branch from `agent-spec-prompt.md` (stages 4.1–4.5, one commit per stage). Design notes and how to add an operation: [agent/README.md](agent/README.md).
 
-EZStore includes a natural-language quotation assistant built with Google ADK 2.x. The agent is a **graph Workflow**: only one node calls the LLM (intent classification); tool selection, argument passing, clarification and refusal are all deterministic program logic.
+EZStore includes a natural-language quotation assistant built with Google ADK 2.x (`google-adk[mcp,a2a]>=2.10,<3`, Python 3.12). The agent is a **graph Workflow**: only one node calls the LLM (intent classification); tool selection, tool arguments, clarification and refusal are all decided by code.
 
 **Architecture:**
 
 ```
-User → React Chat UI → nginx /agent-api → Agent (ADK FastAPI, port 8080) → MCP Server (port 8000) → Backend REST API
-                                               │                                  Streamable HTTP
-                                          Gemini 3.8 Flash                        (mcp Python SDK 2.x)
-                                        (AI Studio API key)
-
-Workflow graph (agent/quotation_agent/agent.py):
-
-  START → load_context → classify_intent (LLM, output_schema=Intent) → route
-            ├─ get_quotation / list_customer_quotations / duplicate_quotation
-            ├─ update_pricing_factor / adjust_total_price / convert_to_order    ← each calls one MCP tool
-            ├─ clarify     (missing fields → ask, keep state.pending_intent)
-            └─ off_topic   (fixed refusal, decided by code)
-          all → respond    (emit text + update state.chat_history)
+User → React Chat UI → nginx /agent-api → Agent (ADK FastAPI, port 8080, internal) → MCP Server (port 8000) → Backend REST API
+                                               │                                         Streamable HTTP
+                                          Gemini 3.8 Flash                               (mcp Python SDK 2.x)
+                                  (AI Studio API key or Vertex AI)
 ```
 
-Every user message re-runs the graph from `START`; cross-turn memory lives in session state (`chat_history`, `pending_intent`), so a user can answer a clarification question in the next message.
+**Workflow graph** (`agent/quotation_agent/agent.py`, ADK app name `quotation_agent`):
+
+```
+START → prepare_input → classify_intent (LLM, output_schema=IntentResult) → route_intent
+          ├─ get_quotation / list_customer_quotations / duplicate_quotation
+          ├─ update_pricing_factor / adjust_total_price / convert_to_order    ← each calls exactly one MCP tool
+          ├─ clarify   (a required field is missing → ask for it; operation kept in state.pending_operation)
+          └─ refuse    (fixed refusal text, decided by code)
+        all → respond  (the only node whose text the Chat UI shows)
+```
+
+| Node | Type | What it does |
+|------|------|--------------|
+| `prepare_input` | function | Builds the classifier input: last 6 messages of session history, the pending operation (if any) and the current message |
+| `classify_intent` | `LlmAgent` | The only LLM call. Returns `IntentResult` (intent + quotation number / customer name / pricing factor / target total), temperature 0, no conversation contents of its own |
+| `route_intent` | function | Picks the next node with `Event(route=...)`: refuses off-topic intents and customer/product CRUD requests (regex guard), validates the `QT-YYYYMMDD-NNN` format, merges a pending operation, asks for missing fields |
+| 6 operation nodes | function | Call one MCP tool each through `McpToolset` + `StreamableHTTPConnectionParams(MCP_URL)` and return the tool text unchanged; tool errors become `操作失敗：…` |
+| `clarify` / `refuse` | function | Pass the question / refusal text built by `route_intent` |
+| `respond` | function | Emits the final text; the frontend only displays events whose `nodeInfo.path` ends in `/respond@<n>` |
+
+Every user message re-runs the graph from `START`. A follow-up answer works in two ways: `route_intent` stores the waiting operation in session state, and `prepare_input` passes recent history to the classifier, so the follow-up also works when earlier turns are only seeded as events (which is what `agents-cli eval` does for multi-turn cases).
 
 **Capabilities:**
 
@@ -290,31 +304,94 @@ Every user message re-runs the graph from `START`; cross-turn memory lives in se
 | Convert to order | Create an order from the quotation's customer and items, linked via `quotation_id`; the quotation itself is untouched |
 
 **Key design:**
-- All modifications use **copy-on-write** — the original quotation is never changed
-- All responses include **plain-text system links** to the quotation/order detail pages
-- Off-topic requests are **refused by code**, missing fields trigger a **clarification turn**
-- Agent runs even without an API key (chat returns a clear error), so `docker compose up` never fails on a missing key
+- All modifications use **copy-on-write**. The original quotation is never changed, and the reply says so (the MCP tool text, shown verbatim, contains `（未修改）`)
+- All responses include **plain-text system links** (`http://localhost:3000/quotations/<id>`, `/orders/<id>`), never Markdown links
+- Off-topic requests are **refused by code**; missing fields trigger a **clarification turn** that the next message completes
+- Model calls retry **429 and 503 with exponential backoff** (google-genai `HttpRetryOptions`: 4 attempts, about 2 s / 4 s / 8 s plus jitter). If the quota is still exhausted, the user gets a clear `RESOURCE_EXHAUSTED` message instead of a stack trace
+- The agent starts without any credentials (chat returns a clear "credentials not set" error), so `docker compose up` never fails on a missing key
 
-**Local development:**
+**Environment variables:**
+
+| Variable | Set in | Purpose |
+|----------|--------|---------|
+| `GEMINI_API_KEY` | root `.env` (Compose) · `agent/.env` (local) | Google AI Studio key for the classifier (and the eval quality judge) |
+| `GOOGLE_GENAI_USE_VERTEXAI` | root `.env` · `agent/.env` | `FALSE` = AI Studio (default); `true` = run the agent's model on Vertex AI |
+| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` | root `.env` · `agent/.env` | Vertex AI project / location (`global`). Needed locally for `agents-cli eval` grading even with AI Studio, see below |
+| `AGENT_MODEL` | root `.env` · `agent/.env` | Model name, default `gemini-3.8-flash` (also used by the quality judge) |
+| `MCP_URL` | Compose: `http://mcp-server:8000/mcp` · `agent/.env`: `http://localhost:8010/mcp` | MCP Server endpoint |
+| `FRONTEND_URL` | root `.env` (mcp-server) · `agent/.env` | Base URL of the system links (they are generated by the MCP Server) |
+| `ALLOW_ORIGINS` | root `.env` | CORS origins of the agent API |
+| `MCP_HOST_PORT` | root `.env` | Host port of the MCP Server, default `8010` |
+
+In Compose the agent listens on port 8080 **inside the Docker network only** (host port 8080 is the backend). The Chat UI reaches it through nginx at `/agent-api/`. Vertex AI inside Docker also needs the ADC file mounted; see the commented lines of the `agent` service in `docker-compose.yml`.
+
+**Local development** (db, backend and mcp-server running in Compose; mcp-server is exposed on host port 8010):
 
 ```bash
-# MCP Server (port 8010 to avoid clashing with other local services)
-cd mcp_server && uv sync
-BACKEND_URL=http://localhost:8080 MCP_PORT=8010 uv run python server.py
-
-# Agent (in another terminal)
-cd agent && cp .env.example .env    # fill GEMINI_API_KEY, set MCP_URL=http://localhost:8010/mcp
-                                    # or Vertex AI: GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT after `gcloud auth application-default login`
-uv sync --group dev
-agents-cli playground               # web UI
+cd agent
+cp .env.example .env                 # set GEMINI_API_KEY; keep GOOGLE_GENAI_USE_VERTEXAI=FALSE and MCP_URL=http://localhost:8010/mcp
+uv sync --group dev --extra eval
+agents-cli playground --port 8501    # use 8501: port 8080 is taken by the backend
+                                     # open http://127.0.0.1:8501/dev-ui/?app=quotation_agent
 agents-cli run "我要查詢報價單，報價單編號：QT-20260330-001"
-
-# Tests
-uv run pytest tests/unit -q                       # no LLM, no MCP
-MCP_URL=http://localhost:8010/mcp uv run pytest tests/integration -q   # offline graph tests (+ LLM tests when key is set)
-agents-cli eval run --dataset tests/eval/datasets/quotation-actions.json    # 6 action cases (creates data; reseed before rerun)
-agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json # 2 refusals + 1 multi-turn clarification
 ```
+
+**Tests:**
+
+```bash
+uv run pytest tests/unit -q                              # no LLM, no MCP: routing rules + model retry/429 against a local fake Gemini endpoint
+uv run --env-file .env pytest tests/integration -q       # real model (3 calls): runner, /run_sse, A2A stream, agent card (uses port 8000)
+agents-cli eval run                                      # read-only smoke set (tests/eval/datasets/basic-dataset.json)
+agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json --config tests/eval/eval_config.yaml   # 2 refusals + 1 multi-turn
+docker compose exec db psql -U ezstore -f /scripts/seed-test-data.sql   # (repo root) reseed before the actions set
+agents-cli eval run --dataset tests/eval/datasets/quotation-actions.json --config tests/eval/eval_config.yaml      # 6 operations, creates data
+python3 scripts/grading/grade_agent.py --suite scripts/grading/student-suite.json --runs 2                          # (repo root) self-acceptance score 0–100
+```
+
+> **Eval grading needs Google Cloud, even with an AI Studio key.** With agents-cli 1.11 and google-cloud-aiplatform 2.6.0, `agents-cli eval grade` fails without Application Default Credentials. The eval SDK always constructs a Cloud Storage client, even when only code metrics run. `prompt_template` judges such as `refusal_or_action` also run on the **Vertex AI Eval Service**, which needs a project. One-time setup:
+> 1. `gcloud auth application-default login`
+> 2. Pick a project with billing, enable the Vertex AI API (`aiplatform.googleapis.com`), and add `GOOGLE_CLOUD_PROJECT=<project-id>` and `GOOGLE_CLOUD_LOCATION=global` to `agent/.env`. Keep `GEMINI_API_KEY` and `GOOGLE_GENAI_USE_VERTEXAI=FALSE`: the agent and the quality judge stay on AI Studio, and only the `prompt_template` judge runs on Vertex AI.
+> 3. On a new project, if the judge returns `404 … Gaia id not found for email service-…@gcp-sa-aiplatform.iam.gserviceaccount.com`, create the Vertex AI service identity: `gcloud beta services identity create --service=aiplatform.googleapis.com --project=<project-id>`.
+
+#### Evaluation report
+
+**What was evaluated:** 11 cases. The six operations (`quotation-actions.json`), two off-topic requests and one multi-turn clarification (`quotation-guardrails.json`), plus the grader's two extra cases (a quotation that does not exist, and a request for Markdown links).
+
+**How it was evaluated** (`agent/tests/eval/eval_config.yaml`):
+
+| Metric | Kind | What it guards |
+|--------|------|----------------|
+| `custom_response_quality` | LLM judge, 1–5, local (`response_quality.py`, google-genai) | Overall accuracy and clarity against each case's `reference` |
+| `link_present` | Code check, 0/1 (`link_presence.py`) | A plain-text `/quotations/<id>` or `/orders/<id>` link; Markdown links score 0; `off_topic*` cases need no link |
+| `refusal_or_action` | LLM judge, 0/1, `prompt_template` on the Vertex AI Eval Service | Off-topic → refuse without tools; operation → completed with plain-text links; missing data → asking counts |
+| `agent_turn_count` | Code, count | Number of turns (2 for the multi-turn case) |
+
+The backend checks in `scripts/grading/grade_agent.py` confirm in the database that the original quotation is unchanged and that the copies and the linked order exist.
+
+**Results:**
+
+| Run | custom_response_quality | link_present | refusal_or_action | agent_turn_count |
+|-----|-------------------------|--------------|-------------------|------------------|
+| guardrails (3 cases) | 5.0 | 1.0 | 1.0 | 1.33 (multi-turn case: 2) |
+| actions (6 cases, after reseed) | 5.0 | 1.0 | 1.0 | 1.0 |
+
+Self-acceptance grading (`student-suite.json`, `--runs 2`): **99.6 / 100**. guardrails 30.0/30, actions 49.6/50 (all four backend checks passed: original untouched, 6 copies, a copy with factor 1.5, order linked to the original), extra 20.0/20. The lowest case was `get_quotation` at 90%: in one of the two runs the Vertex AI judge returned malformed JSON (`400 INVALID_ARGUMENT … Error parsing JSON`), which the grader counts as 0. The agent's reply was identical and correct in both runs.
+
+**Stability:** across the two grading runs every case scored the same except that one judge error. The classifier runs at temperature 0, and every user-visible reply is either fixed text or verbatim MCP tool output, so replies are reproducible. Only the model's intent and parameter extraction can vary.
+
+**Problems found and handled:**
+
+| Problem | Handling |
+|---------|----------|
+| `agents-cli eval` seeds earlier turns of a multi-turn case as events and never runs them, so no session state exists for the follow-up | `prepare_input` also feeds recent session history to the classifier; `clarify_then_complete` passes |
+| The multi-turn case reported `agent_turn_count` = 1 | Previous round moved to `agent_data.turns[0]`, follow-up to `turns[1]` |
+| A model error or missing credentials crashed the workflow (`route_intent` received `None`) | `route_intent` now ends the turn without calling tools; the error event carries a clear message (unit-tested against a fake Gemini endpoint) |
+| The free tier quota (20 requests/day) ran out during development (`429 RESOURCE_EXHAUSTED`) | Exponential-backoff retry for 429/503 and a clear quota message |
+| MCP errors were shown as `Error executing tool get_quotation: …` | Prefix stripped: `操作失敗：找不到報價單編號 …` |
+| Grading failed with an AI Studio key only (`DefaultCredentialsError`, then `Could not determine GCP project`, then `404 Gaia id not found` on a new project) | Google Cloud setup above (ADC, project with the Vertex AI API, service identity); the agent itself stays on AI Studio |
+| `Could not fetch /app-info … grading will degrade` during generate | Expected: ADK's experimental endpoint only supports an `LlmAgent` root (`"Root agent is not an LlmAgent"`); our metrics do not use that data |
+
+**Risks not yet covered** (next test cases): similar customer names (without an exact match the MCP Server falls back to the first fuzzy match), Chinese numerals such as 「十萬」 or 「打九折」, two operations in one message, and the deliberate "break test" from eval-lab section 7 (switch `respond` to Markdown links and confirm that `link_present` and `refusal_or_action` drop to 0).
 
 Trustworthiness evaluation labs for learners: [eval-lab-quick.md](eval-lab-quick.md) (25 min, in class) and [eval-lab.md](eval-lab.md) (60–90 min, full version).
 
@@ -369,10 +446,11 @@ HTTP Request → Handler (Gin) → Service (business logic) → Repository (GORM
 | API clients | `frontend/src/api/*.ts` |
 | Page components | `frontend/src/pages/*.tsx` |
 | Shared components | `frontend/src/components/shared/*.tsx` |
-| Agent workflow graph | `agent/quotation_agent/agent.py` (`Workflow`, `Intent`, node functions) |
-| Agent prompts / fixed replies | `agent/quotation_agent/prompts.py` |
+| Agent workflow graph | `agent/quotation_agent/agent.py` (`Workflow`, `Intent`, `IntentResult`, node functions) |
+| Agent prompts / fixed replies | `agent/quotation_agent/agent.py` (`classify_intent.instruction`, `REFUSAL_TEXT`, `ARG_LABELS`, …) |
 | Agent FastAPI app | `agent/quotation_agent/fast_api_app.py` |
-| Agent eval | `agent/tests/eval/eval_config.yaml`, `agent/tests/eval/datasets/*.json` |
+| Agent eval | `agent/tests/eval/eval_config.yaml`, `agent/tests/eval/link_presence.py`, `agent/tests/eval/datasets/*.json` |
+| Agent unit tests | `agent/tests/unit/test_route_intent.py`, `agent/tests/unit/test_model_errors.py` |
 | MCP Server (6 tools, mcp 2.x `MCPServer`) | `mcp_server/server.py` |
 | Agent Chat UI | `frontend/src/pages/AgentChatPage.tsx` |
 | Agent API client | `frontend/src/api/agentApi.ts` |
@@ -498,13 +576,15 @@ bun run build                             # production build → dist/
 cd mcp_server
 uv sync && BACKEND_URL=http://localhost:8080 MCP_PORT=8010 uv run python server.py
 
-# Agent (reads agent/.env: GEMINI_API_KEY, MCP_URL, AGENT_MODEL)
+# Agent (reads agent/.env: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI=FALSE, MCP_URL, AGENT_MODEL;
+#        eval grading also needs ADC + GOOGLE_CLOUD_PROJECT, see the AI Agent section)
 cd agent
-uv sync --group dev
-agents-cli playground                     # local web UI
+uv sync --group dev --extra eval
+agents-cli playground --port 8501         # local web UI (8080 is the backend)
 agents-cli run "我要查詢報價單，報價單編號：QT-20260330-001"
-uv run pytest tests/unit tests/integration -q
-agents-cli eval run                       # LLM-judged eval over tests/eval/datasets
+uv run pytest tests/unit -q               # no LLM, no MCP
+uv run --env-file .env pytest tests/integration -q   # real model calls
+agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json --config tests/eval/eval_config.yaml
 ```
 
 ### Common Modification Scenarios

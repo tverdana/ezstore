@@ -27,7 +27,7 @@ EZStore 提供四大核心模組，管理 B2B 銷售流程：
 | 後端 | Go 1.25 · Gin · GORM · Swagger (swaggo) · Testify |
 | 前端 | React 19 · TypeScript · Tailwind CSS 4 · Vite 8 · TanStack React Query · React Hook Form · React Router |
 | 資料庫 | PostgreSQL 16 |
-| AI 智能助理 | Python 3.12 · Google ADK 2.10+（Graph Workflow API）· google-agents-cli 1.7 · Gemini 3.8 Flash · MCP Python SDK 2.x（Streamable HTTP）· uv |
+| AI 智能助理 | Python 3.12 · Google ADK 2.10+（Graph Workflow API）· google-agents-cli 1.11 · Gemini 3.8 Flash · MCP Python SDK 2.x（Streamable HTTP）· uv |
 | 編譯部署 | Docker · Docker Compose · Bun（前端）· Nginx（前端服務與 API 反向代理）|
 
 ### 專案目錄結構
@@ -38,8 +38,11 @@ ezstore/
 ├── scripts/
 │   └── seed-test-data.sql      # 冪等測試資料集（TRUNCATE + INSERT）
 ├── .env.example                # GEMINI_API_KEY 與 Agent 設定（複製為 .env）
-├── agent/                      # ★ LAB 作業 — 本分支不含此資料夾，請依 agent-spec-prompt.md 開發
-│                               #   （agents-cli scaffold → ADK 2.x Graph Workflow → 連接 mcp_server）
+├── agent/                      # ADK 2.x Graph Workflow Agent，依 agent-spec-prompt.md 開發（見 agent/README.md）
+│   ├── Dockerfile
+│   ├── pyproject.toml           # google-adk[mcp,a2a]>=2.10,<3（+ uv.lock）
+│   ├── quotation_agent/         # agent.py（Workflow）、fast_api_app.py（ADK FastAPI + A2A）
+│   └── tests/                   # unit/、integration/、eval/（題庫 + eval_config.yaml）
 ├── mcp_server/
 │   ├── Dockerfile
 │   ├── pyproject.toml           # mcp>=2.2、httpx（含 uv.lock）
@@ -254,29 +257,40 @@ $(go env GOPATH)/bin/swag init -g main.go --parseDependency --parseInternal
 
 ### AI 智能助理
 
-> **本分支（`workshop-start`）是 LAB 的起點。** 後端、前端 Chat UI、MCP Server、資料庫都已提供；`agent/` 服務是你要開發的部分，把 `agent-spec-prompt.md` 餵給 AI coding 工具即可開始。以下說明是你要做出來的目標。
+> `agent/` 是在這個分支依 `agent-spec-prompt.md` 開發完成的（4.1–4.5 各階段各一個 commit）。圖的設計與如何新增一個操作，請看 [agent/README.md](agent/README.md)。
 
-EZStore 內建自然語言報價單管理助手，以 Google ADK 2.x 開發。Agent 是一張 **Graph Workflow 圖**：只有意圖分類節點會呼叫 LLM，工具選擇、參數傳遞、追問與拒答全部由程式決定。
+EZStore 內建自然語言報價單管理助手，以 Google ADK 2.x（`google-adk[mcp,a2a]>=2.10,<3`，Python 3.12）開發。Agent 是一張 **Graph Workflow 圖**：只有意圖分類節點會呼叫 LLM，工具選擇、工具參數、追問與拒答全部由程式決定。
 
 **架構：**
 
 ```
-使用者 → React Chat UI → nginx /agent-api → Agent（ADK FastAPI，port 8080）→ MCP Server（port 8000）→ Backend REST API
-                                               │                                     Streamable HTTP
-                                          Gemini 3.8 Flash                           （mcp Python SDK 2.x）
-                                        （AI Studio API key）
-
-Workflow 圖（agent/quotation_agent/agent.py）：
-
-  START → load_context → classify_intent（LLM，output_schema=Intent）→ route
-            ├─ get_quotation / list_customer_quotations / duplicate_quotation
-            ├─ update_pricing_factor / adjust_total_price / convert_to_order    ← 各呼叫一個 MCP 工具
-            ├─ clarify    （缺欄位就追問，並把意圖暫存在 state.pending_intent）
-            └─ off_topic  （固定拒答，由程式決定）
-          全部 → respond  （輸出文字、更新 state.chat_history）
+使用者 → React Chat UI → nginx /agent-api → Agent（ADK FastAPI，port 8080，僅內部網路）→ MCP Server（port 8000）→ Backend REST API
+                                               │                                               Streamable HTTP
+                                          Gemini 3.8 Flash                                     （mcp Python SDK 2.x）
+                                   （AI Studio API key 或 Vertex AI）
 ```
 
-每一則使用者訊息都會從 `START` 重新跑一次圖；跨回合的記憶放在 session state（`chat_history`、`pending_intent`），所以使用者可以在下一句補上被追問的資料。
+**Workflow 圖**（`agent/quotation_agent/agent.py`，ADK app 名稱 `quotation_agent`）：
+
+```
+START → prepare_input → classify_intent（LLM，output_schema=IntentResult）→ route_intent
+          ├─ get_quotation / list_customer_quotations / duplicate_quotation
+          ├─ update_pricing_factor / adjust_total_price / convert_to_order    ← 各呼叫一個 MCP 工具
+          ├─ clarify   （缺少必要欄位 → 追問；操作暫存在 state.pending_operation）
+          └─ refuse    （固定拒答文字，由程式決定）
+        全部 → respond （Chat UI 只顯示這個節點的文字）
+```
+
+| 節點 | 類型 | 作用 |
+|------|------|------|
+| `prepare_input` | 函式 | 組出意圖分類的輸入：session 最近 6 則對話、等待補資料的操作（若有）與目前訊息 |
+| `classify_intent` | `LlmAgent` | 唯一的 LLM 呼叫。輸出 `IntentResult`（意圖＋報價單編號／客戶名稱／報價因子／目標總價），temperature 0，不帶自己的對話內容 |
+| `route_intent` | 函式 | 以 `Event(route=...)` 選下一個節點：離題意圖與客戶／產品的新增修改刪除（regex 防護）一律拒答、驗證 `QT-YYYYMMDD-NNN` 格式、合併等待中的操作、追問缺少的欄位 |
+| 6 個操作節點 | 函式 | 透過 `McpToolset` + `StreamableHTTPConnectionParams(MCP_URL)` 各呼叫一個 MCP 工具，工具文字原樣回傳；工具錯誤轉成 `操作失敗：…` |
+| `clarify` / `refuse` | 函式 | 輸出 `route_intent` 組好的追問／拒答文字 |
+| `respond` | 函式 | 輸出最終回覆；前端只顯示 `nodeInfo.path` 結尾為 `/respond@<n>` 的事件 |
+
+每一則使用者訊息都會從 `START` 重新跑一次圖。補資料的下一句有兩條路接續：`route_intent` 把等待中的操作存在 session state，`prepare_input` 也把最近的對話紀錄交給分類器。所以即使前幾輪只是被「注入」成事件（`agents-cli eval` 的多輪案例就是這樣），也能接續完成。
 
 **功能：**
 
@@ -290,31 +304,94 @@ Workflow 圖（agent/quotation_agent/agent.py）：
 | 報價單轉訂單 | 依報價單的客戶與品項建立訂單並以 `quotation_id` 關聯；報價單本身不動 |
 
 **設計原則：**
-- 所有修改採用 **copy-on-write** — 原始報價單永遠不會被直接更動
-- 所有回覆包含 **純文字系統連結**，直接點開報價單／訂單頁
-- 離題請求 **由程式拒答**，缺少必要欄位時 **追問一輪**
-- 沒有 API key 時 Agent 仍會啟動（對話回傳清楚錯誤），`docker compose up` 不會因缺金鑰而失敗
+- 所有修改採用 **copy-on-write**，原始報價單永遠不會被更動，回覆也會說明（原樣呈現的 MCP 工具文字含 `（未修改）`）
+- 所有回覆包含 **純文字系統連結**（`http://localhost:3000/quotations/<id>`、`/orders/<id>`），不用 Markdown 連結
+- 離題請求 **由程式拒答**；缺少必要欄位時 **追問一輪**，下一句補上即可接續完成
+- 模型呼叫遇到 **429 與 503 會以指數退避重試**（google-genai `HttpRetryOptions`：共 4 次，約 2／4／8 秒再加抖動）；額度仍用完時回傳清楚的 `RESOURCE_EXHAUSTED` 訊息，而不是錯誤堆疊
+- 沒有任何憑證時 Agent 仍會啟動（對話回傳「尚未設定模型憑證」的清楚錯誤），`docker compose up` 不會因缺金鑰而失敗
 
-**本機開發：**
+**環境變數：**
+
+| 變數 | 設定位置 | 用途 |
+|------|----------|------|
+| `GEMINI_API_KEY` | 專案根目錄 `.env`（Compose）· `agent/.env`（本機） | Google AI Studio 金鑰，給意圖分類（以及 eval 的品質評審） |
+| `GOOGLE_GENAI_USE_VERTEXAI` | 根目錄 `.env` · `agent/.env` | `FALSE` = AI Studio（預設）；`true` = Agent 的模型改走 Vertex AI |
+| `GOOGLE_CLOUD_PROJECT`、`GOOGLE_CLOUD_LOCATION` | 根目錄 `.env` · `agent/.env` | Vertex AI 專案／區域（`global`）。即使用 AI Studio，本機跑 `agents-cli eval` 評分也需要，見下方說明 |
+| `AGENT_MODEL` | 根目錄 `.env` · `agent/.env` | 模型名稱，預設 `gemini-3.8-flash`（品質評審也用它） |
+| `MCP_URL` | Compose：`http://mcp-server:8000/mcp` · `agent/.env`：`http://localhost:8010/mcp` | MCP Server 位址 |
+| `FRONTEND_URL` | 根目錄 `.env`（mcp-server）· `agent/.env` | 系統連結的網址（連結由 MCP Server 產生） |
+| `ALLOW_ORIGINS` | 根目錄 `.env` | Agent API 的 CORS 來源 |
+| `MCP_HOST_PORT` | 根目錄 `.env` | MCP Server 對本機開放的埠，預設 `8010` |
+
+在 Compose 裡 Agent 的 8080 埠 **只開在 Docker 內部網路**（本機的 8080 是 backend），Chat UI 經由 nginx 的 `/agent-api/` 轉發過去。Docker 內改走 Vertex AI 時還要掛載 ADC 憑證檔，請看 `docker-compose.yml` 裡 `agent` 服務被註解的那幾行。
+
+**本機開發**（db、backend、mcp-server 在 Compose 裡跑；mcp-server 對本機開放 8010 埠）：
 
 ```bash
-# MCP Server（用 8010 避免與本機其他服務撞埠）
-cd mcp_server && uv sync
-BACKEND_URL=http://localhost:8080 MCP_PORT=8010 uv run python server.py
-
-# Agent（另開終端）
-cd agent && cp .env.example .env    # 填 GEMINI_API_KEY，MCP_URL 改為 http://localhost:8010/mcp
-                                    # 或改走 Vertex AI：先 `gcloud auth application-default login`，再設 GOOGLE_GENAI_USE_VERTEXAI=true 與 GOOGLE_CLOUD_PROJECT
-uv sync --group dev
-agents-cli playground               # 網頁介面
+cd agent
+cp .env.example .env                 # 填 GEMINI_API_KEY；保留 GOOGLE_GENAI_USE_VERTEXAI=FALSE 與 MCP_URL=http://localhost:8010/mcp
+uv sync --group dev --extra eval
+agents-cli playground --port 8501    # 請用 8501：8080 已被 backend 使用
+                                     # 開啟 http://127.0.0.1:8501/dev-ui/?app=quotation_agent
 agents-cli run "我要查詢報價單，報價單編號：QT-20260330-001"
-
-# 測試
-uv run pytest tests/unit -q                                            # 不需 LLM、不需 MCP
-MCP_URL=http://localhost:8010/mcp uv run pytest tests/integration -q   # 離線圖測試（有金鑰時一併跑 LLM 測試）
-agents-cli eval run --dataset tests/eval/datasets/quotation-actions.json     # 6 個操作案例（會新增資料，重跑前重灌 seed）
-agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json  # 2 個拒答 + 1 個多輪追問
 ```
+
+**測試：**
+
+```bash
+uv run pytest tests/unit -q                              # 不需 LLM、不需 MCP：路由規則＋對本機假 Gemini 端點測重試與 429
+uv run --env-file .env pytest tests/integration -q       # 真的呼叫模型（3 次）：runner、/run_sse、A2A 串流、agent card（會用到 8000 埠）
+agents-cli eval run                                      # 唯讀的冒煙測試集（tests/eval/datasets/basic-dataset.json）
+agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json --config tests/eval/eval_config.yaml   # 2 個拒答 + 1 個多輪追問
+docker compose exec db psql -U ezstore -f /scripts/seed-test-data.sql   # （在專案根目錄）跑 actions 前先重灌 seed
+agents-cli eval run --dataset tests/eval/datasets/quotation-actions.json --config tests/eval/eval_config.yaml      # 6 個操作，會新增資料
+python3 scripts/grading/grade_agent.py --suite scripts/grading/student-suite.json --runs 2                          # （在專案根目錄）自我驗收分數 0–100
+```
+
+> **即使用 AI Studio 金鑰，eval 評分也需要 Google Cloud。** 在 agents-cli 1.11 與 google-cloud-aiplatform 2.6.0 下，沒有 Application Default Credentials 時 `agents-cli eval grade` 會失敗。eval SDK 一律會建立 Cloud Storage client，即使只跑程式判定的指標也一樣。而 `refusal_or_action` 這類 `prompt_template` 評審在 **Vertex AI Eval Service** 上執行，需要 GCP 專案。只需設定一次：
+> 1. `gcloud auth application-default login`
+> 2. 選一個已啟用計費的專案，啟用 Vertex AI API（`aiplatform.googleapis.com`），在 `agent/.env` 加上 `GOOGLE_CLOUD_PROJECT=<專案 ID>` 與 `GOOGLE_CLOUD_LOCATION=global`。保留 `GEMINI_API_KEY` 與 `GOOGLE_GENAI_USE_VERTEXAI=FALSE`：Agent 與品質評審仍走 AI Studio，只有 `prompt_template` 評審走 Vertex AI。
+> 3. 新專案若評審回傳 `404 … Gaia id not found for email service-…@gcp-sa-aiplatform.iam.gserviceaccount.com`，請建立 Vertex AI service identity：`gcloud beta services identity create --service=aiplatform.googleapis.com --project=<專案 ID>`。
+
+#### 評估報告
+
+**評估了什麼：** 共 11 個案例。六個操作（`quotation-actions.json`）、兩個離題請求與一個多輪追問（`quotation-guardrails.json`），以及評分程式的兩題額外考題（查無此報價單、要求 Markdown 連結）。
+
+**怎麼評估**（`agent/tests/eval/eval_config.yaml`）：
+
+| 指標 | 類型 | 守住什麼 |
+|------|------|----------|
+| `custom_response_quality` | LLM 評審，1–5，本機執行（`response_quality.py`，google-genai） | 對照每題 `reference` 的整體正確性與清楚程度 |
+| `link_present` | 程式判定，0/1（`link_presence.py`） | 純文字 `/quotations/<id>` 或 `/orders/<id>` 連結；Markdown 連結給 0；`off_topic*` 案例不需連結 |
+| `refusal_or_action` | LLM 評審，0/1，`prompt_template`，在 Vertex AI Eval Service 執行 | 離題 → 拒答且不呼叫工具；報價單操作 → 完成且用純文字連結；缺資料 → 追問也算符合 |
+| `agent_turn_count` | 程式，計數 | 回合數（多輪案例為 2） |
+
+`scripts/grading/grade_agent.py` 另外直接查資料庫，確認原單未被更動、複製單與關聯訂單確實存在。
+
+**結果：**
+
+| 執行 | custom_response_quality | link_present | refusal_or_action | agent_turn_count |
+|------|-------------------------|--------------|-------------------|------------------|
+| guardrails（3 題） | 5.0 | 1.0 | 1.0 | 1.33（多輪案例為 2） |
+| actions（6 題，重灌 seed 後） | 5.0 | 1.0 | 1.0 | 1.0 |
+
+自我驗收評分（`student-suite.json`，`--runs 2`）：**99.6 / 100**。guardrails 30.0/30、actions 49.6/50（四項後端核對全過：原單未動、6 張複製單、因子 1.5 的複製單、訂單關聯原單）、extra 20.0/20。最低分是 `get_quotation` 的 90%：兩次中有一次 Vertex AI 評審回傳了格式錯誤的 JSON（`400 INVALID_ARGUMENT … Error parsing JSON`），評分程式把它算成 0。Agent 兩次的回覆完全相同且正確。
+
+**穩定性：** 兩次評分中，除了那一次評審錯誤，每一題的分數都相同。意圖分類以 temperature 0 執行，而使用者看到的每一則回覆不是固定文字就是原樣的 MCP 工具輸出，所以回覆可以重現。會變動的只有模型擷取意圖與參數這一步。
+
+**發現並處理的問題：**
+
+| 問題 | 處理方式 |
+|------|----------|
+| `agents-cli eval` 的多輪案例只把前幾輪注入成事件、不會真的執行，所以補資料那一句沒有 session state | `prepare_input` 也把最近的對話紀錄交給分類器；`clarify_then_complete` 通過 |
+| 多輪案例的 `agent_turn_count` 只有 1 | 前一輪放在 `agent_data.turns[0]`，補資料那一句放在 `turns[1]` |
+| 模型錯誤或沒有憑證時整個 Workflow 當掉（`route_intent` 收到 `None`） | `route_intent` 改為結束這一輪、不呼叫工具；錯誤事件帶清楚訊息（對假 Gemini 端點做了單元測試） |
+| 開發中用完免費額度（每日 20 次，`429 RESOURCE_EXHAUSTED`） | 429／503 指數退避重試，並回傳清楚的額度訊息 |
+| MCP 錯誤顯示成 `Error executing tool get_quotation: …` | 去掉前綴：`操作失敗：找不到報價單編號 …` |
+| 只用 AI Studio 金鑰時評分失敗（先是 `DefaultCredentialsError`，接著 `Could not determine GCP project`，新專案再遇到 `404 Gaia id not found`） | 依上方說明設定 Google Cloud（ADC、啟用 Vertex AI API 的專案、service identity）；Agent 本身仍走 AI Studio |
+| generate 時出現 `Could not fetch /app-info … grading will degrade` | 預期內：ADK 這個實驗性端點只支援根節點是 `LlmAgent`（`"Root agent is not an LlmAgent"`），我們的指標用不到這些資料 |
+
+**尚未涵蓋的風險**（下一輪的測試案例）：相似的客戶名稱（沒有完全相符時 MCP Server 會取第一筆模糊比對結果）、中文數字如「十萬」「打九折」、一句話裡有兩個操作，以及 eval-lab 第 7 節的「故意弄壞」測試（把 `respond` 改成 Markdown 連結，確認 `link_present` 與 `refusal_or_action` 會掉到 0）。
 
 學員用的可信賴度評鑑 LAB：課堂版 [eval-lab-quick.zh-TW.md](eval-lab-quick.zh-TW.md)（25 分鐘）、完整版 [eval-lab.zh-TW.md](eval-lab.zh-TW.md)（60–90 分鐘，回家做）。
 
@@ -369,6 +446,14 @@ HTTP 請求 → Handler（Gin）→ Service（業務邏輯）→ Repository（GO
 | API 用戶端 | `frontend/src/api/*.ts` |
 | 頁面元件 | `frontend/src/pages/*.tsx` |
 | 共用元件 | `frontend/src/components/shared/*.tsx` |
+| Agent Workflow 圖 | `agent/quotation_agent/agent.py`（`Workflow`、`Intent`、`IntentResult`、各節點函式） |
+| Agent 提示詞／固定回覆 | `agent/quotation_agent/agent.py`（`classify_intent.instruction`、`REFUSAL_TEXT`、`ARG_LABELS`…） |
+| Agent FastAPI app | `agent/quotation_agent/fast_api_app.py` |
+| Agent eval | `agent/tests/eval/eval_config.yaml`、`agent/tests/eval/link_presence.py`、`agent/tests/eval/datasets/*.json` |
+| Agent 單元測試 | `agent/tests/unit/test_route_intent.py`、`agent/tests/unit/test_model_errors.py` |
+| MCP Server（6 個工具，mcp 2.x `MCPServer`） | `mcp_server/server.py` |
+| Agent Chat UI | `frontend/src/pages/AgentChatPage.tsx` |
+| Agent API 用戶端 | `frontend/src/api/agentApi.ts` |
 | Docker 編排 | `docker-compose.yml` |
 | 測試資料集 | `scripts/seed-test-data.sql` |
 
@@ -486,6 +571,20 @@ cd frontend
 bun install                               # 安裝依賴
 bun run dev                               # 開發伺服器（port 5173，代理 /api 到 :8080）
 bun run build                             # 正式建置 → dist/
+
+# MCP Server
+cd mcp_server
+uv sync && BACKEND_URL=http://localhost:8080 MCP_PORT=8010 uv run python server.py
+
+# Agent（讀取 agent/.env：GEMINI_API_KEY、GOOGLE_GENAI_USE_VERTEXAI=FALSE、MCP_URL、AGENT_MODEL；
+#        eval 評分另需 ADC 與 GOOGLE_CLOUD_PROJECT，見「AI 智能助理」一節）
+cd agent
+uv sync --group dev --extra eval
+agents-cli playground --port 8501         # 本機網頁介面（8080 是 backend）
+agents-cli run "我要查詢報價單，報價單編號：QT-20260330-001"
+uv run pytest tests/unit -q               # 不需 LLM、不需 MCP
+uv run --env-file .env pytest tests/integration -q   # 會真的呼叫模型
+agents-cli eval run --dataset tests/eval/datasets/quotation-guardrails.json --config tests/eval/eval_config.yaml
 ```
 
 ### 常見修改場景
