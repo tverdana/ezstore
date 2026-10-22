@@ -14,20 +14,24 @@
 
 FROM python:3.12-slim
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:0.8.13 /uv /uvx /bin/
+# Install uv（與產生 uv.lock 的版本一致）
+COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /uvx /bin/
 
 WORKDIR /code
 
-COPY ./pyproject.toml ./README.md ./uv.lock* ./
+# 先只裝依賴，程式碼變動時可沿用這一層快取
+COPY ./pyproject.toml ./README.md ./uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY ./quotation_agent ./quotation_agent
-
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
 ARG AGENT_VERSION=0.0.0
 ENV AGENT_VERSION=${AGENT_VERSION}
 
 EXPOSE 8080
 
-CMD ["uv", "run", "uvicorn", "quotation_agent.fast_api_app:app", "--host", "0.0.0.0", "--port", "8080"]
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=10 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/list-apps', timeout=2)"
+
+CMD ["uv", "run", "--no-sync", "uvicorn", "quotation_agent.fast_api_app:app", "--host", "0.0.0.0", "--port", "8080"]

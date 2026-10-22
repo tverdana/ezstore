@@ -47,6 +47,27 @@ services:
       backend:
         condition: service_started
 
+  agent:
+    image: ghcr.io/cshliu77/ezstore/agent:latest
+    pull_policy: always
+    environment:
+      MCP_URL: http://mcp-server:8000/mcp
+      AGENT_MODEL: ${AGENT_MODEL:-gemini-3.8-flash}
+      ALLOW_ORIGINS: ${ALLOW_ORIGINS:-http://localhost:3000}
+      # 模型憑證取自專案根目錄的 .env（二選一）；沒有設定時系統照常啟動，只有對話會回報錯誤
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+    # Vertex AI 需要 ADC 憑證時，取消下列註解（先執行 gcloud auth application-default login）
+    #   GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+    # volumes:
+    #   - ~/.config/gcloud/application_default_credentials.json:/gcloud/application_default_credentials.json:ro
+    # 只在 Compose 內部網路開放 8080（本機 8080 是 backend），前端 nginx 以 /agent-api/ 轉發
+    expose:
+      - "8080"
+    depends_on:
+      - mcp-server
 
   frontend:
     image: ghcr.io/cshliu77/ezstore/frontend:latest
@@ -56,6 +77,7 @@ services:
     depends_on:
       - backend
       - mcp-server
+      - agent
 
   e2e:
     image: ghcr.io/cshliu77/ezstore/e2e:latest

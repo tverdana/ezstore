@@ -1,0 +1,11 @@
+# 只有 pyproject.toml、README.md、uv.lock 與 quotation_agent/ 會進映像檔
+.venv/
+.env
+.env.*
+!.env.example
+**/__pycache__/
+.adk/
+artifacts/
+tests/
+.pytest_cache/
+.ruff_cache/
